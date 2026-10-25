@@ -25,6 +25,8 @@ const formats = {
   audio: ['-f', 'ba/bestaudio', '-x', '--audio-format', 'mp3', '--audio-quality', '0'],
   'audio-best': ['-f', 'ba/bestaudio'],
   jpg: ['--skip-download', '--write-thumbnail', '--convert-thumbnails', 'jpg'],
+  image: [],
+  photos: [],
 }
 const jobs = new Map()
 const requests = []
@@ -37,8 +39,9 @@ export function sourcePlatform(raw) {
     const host = url.hostname.toLowerCase().replace(/\.$/, '')
     if ((host === 'youtube.com' || host === 'www.youtube.com' || host === 'm.youtube.com') && /^\/(watch|shorts\/|live\/)/.test(url.pathname)) return 'youtube'
     if (host === 'youtu.be' && /^\/[\w-]{6,}/.test(url.pathname)) return 'youtube'
-    if ((host === 'tiktok.com' || host === 'www.tiktok.com' || host === 'm.tiktok.com') && /^\/@[^/]+\/video\/\d+/.test(url.pathname)) return 'tiktok'
+    if ((host === 'tiktok.com' || host === 'www.tiktok.com' || host === 'm.tiktok.com') && /^\/@[^/]+\/(video|photo)\/\d+/.test(url.pathname)) return 'tiktok'
     if ((host === 'instagram.com' || host === 'www.instagram.com') && /^\/(reel|reels|p)\/[\w-]+/.test(url.pathname)) return 'instagram'
+    if ((host === 'pinterest.com' || host.endsWith('.pinterest.com')) && /^\/pin\/(?:[\w-]+--)?\d+\/?$/.test(url.pathname)) return 'pinterest'
   } catch { /* enlace inválido */ }
   return null
 }
@@ -105,6 +108,43 @@ function runDownload(url, format, dir) {
   })
 }
 
+function runGallery(url, dir) {
+  return new Promise((resolve, reject) => {
+    const args = ['-m', 'gallery_dl', '--config-ignore', '--no-input', '-D', dir, url]
+    const child = spawn('python3', args, { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true, env: { ...process.env, PYTHONPATH: path.join(root, 'vendor') } })
+    let stderr = ''
+    let settled = false
+    const finish = error => { if (settled) return; settled = true; clearTimeout(timer); error ? reject(error) : resolve() }
+    const timer = setTimeout(() => { child.kill(); finish(new Error('Las imágenes tardaron demasiado en procesarse.')) }, 180000)
+    child.stderr.on('data', chunk => { stderr = (stderr + String(chunk)).slice(-4000) })
+    child.on('error', finish)
+    child.on('close', code => finish(code === 0 ? null : new Error(stderr.trim().split('\n').at(-1) || 'No se pudieron extraer las imágenes.')))
+  })
+}
+
+function packImages(dir, files) {
+  return new Promise((resolve, reject) => {
+    const archive = path.join(dir, 'download.zip')
+    const child = spawn('zip', ['-q', '-j', archive, ...files], { stdio: 'ignore', windowsHide: true })
+    child.on('error', reject)
+    child.on('close', code => code === 0 ? resolve(archive) : reject(new Error('No se pudo empaquetar la galería.')))
+  })
+}
+
+function downloadedImages(dir) {
+  const found = []
+  const scan = folder => {
+    for (const entry of readdirSync(folder, { withFileTypes: true })) {
+      const file = path.join(folder, entry.name)
+      if (entry.isDirectory()) scan(file)
+      else if (entry.isFile() && /\.(jpg|jpeg|png|webp)$/i.test(entry.name)) found.push(file)
+      if (found.length > 50) throw new Error('Esta publicación tiene más de 50 imágenes; descarga una galería más pequeña.')
+    }
+  }
+  scan(dir)
+  return found
+}
+
 async function bodyJson(req) {
   let text = ''
   for await (const chunk of req) {
@@ -116,7 +156,7 @@ async function bodyJson(req) {
 
 export const server = createServer(async (req, res) => {
   const pathname = new URL(req.url || '/', 'http://localhost').pathname
-  if (pathname === '/health' && req.method === 'GET') return json(res, 200, { ok: true, engine: existsSync(binary) && existsSync(ffmpeg) })
+  if (pathname === '/health' && req.method === 'GET') return json(res, 200, { ok: true, engine: existsSync(binary) && existsSync(ffmpeg), gallery: existsSync(path.join(root, 'vendor', 'gallery_dl')) })
   const origin = String(req.headers.origin || '')
   const isFileDownload = req.method === 'GET' && /^\/api\/dl\/file\/[a-f0-9-]{36}$/.test(pathname)
   if (origin && !cors(res, origin)) return json(res, 403, { error: 'Origen no permitido.' })
@@ -137,19 +177,26 @@ export const server = createServer(async (req, res) => {
       const url = String(body.url || '')
       const platform = sourcePlatform(url)
       let format = String(body.format || '')
-      if (platform === 'tiktok' && format !== 'audio') format = 'video'
+      const isPhoto = platform === 'tiktok' && /\/photo\/\d+/.test(new URL(url).pathname)
+      if (platform === 'tiktok' && !isPhoto && format !== 'audio') format = 'video'
+      if (isPhoto) format = 'photos'
       if (platform === 'instagram' && format !== 'audio' && format !== 'jpg') format = 'video'
-      if (!platform || !Object.hasOwn(formats, format)) return json(res, 400, { error: 'Usa un enlace público HTTPS de YouTube, TikTok o Instagram.' })
+      if (platform === 'pinterest' && format !== 'image') format = 'video'
+      if (!platform || !Object.hasOwn(formats, format)) return json(res, 400, { error: 'Usa un enlace público HTTPS de YouTube, TikTok, Instagram o Pinterest.' })
+      const galleryMode = format === 'image' || format === 'photos'
+      if (galleryMode && !existsSync(path.join(root, 'vendor', 'gallery_dl'))) return json(res, 503, { error: 'El motor de imágenes todavía no está instalado.' })
       dir = mkdtempSync(path.join(tmpdir(), 'deyvit-dl-'))
-      await runDownload(url, format, dir)
-      const filename = readdirSync(dir).find(name => /^download\.(mp4|mkv|webm|mp3|m4a|jpg|jpeg)$/i.test(name))
+      if (galleryMode) await runGallery(url, dir)
+      else await runDownload(url, format, dir)
+      const imageFiles = galleryMode ? downloadedImages(dir) : []
+      const filename = galleryMode ? imageFiles.length === 1 ? imageFiles[0] : imageFiles.length > 1 ? await packImages(dir, imageFiles) : '' : readdirSync(dir).find(name => /^download\.(mp4|mkv|webm|mp3|m4a|jpg|jpeg)$/i.test(name))
       if (!filename) throw new Error('La plataforma no entregó un archivo descargable.')
-      const file = path.join(dir, filename)
+      const file = path.isAbsolute(filename) ? filename : path.join(dir, filename)
       const size = statSync(file).size
       if (size < 1024) throw new Error('La plataforma entregó un archivo vacío.')
       const id = randomUUID()
       const timer = setTimeout(() => expire(id), 10 * 60000)
-      const shortPlatform = { youtube: 'yt', tiktok: 'tt', instagram: 'ig' }[platform]
+      const shortPlatform = { youtube: 'yt', tiktok: 'tt', instagram: 'ig', pinterest: 'pin' }[platform]
       const downloadName = `dei bv ${shortPlatform}${path.extname(file)}`
       jobs.set(id, { dir, file, size, timer, downloadName, format })
       dir = undefined
@@ -167,7 +214,7 @@ export const server = createServer(async (req, res) => {
     const job = jobs.get(match[1])
     if (!job) return json(res, 404, { error: 'La descarga expiró. Prepárala otra vez.' })
     const extension = path.extname(job.file).toLowerCase()
-    const mime = extension === '.mp3' ? 'audio/mpeg' : extension === '.jpg' || extension === '.jpeg' ? 'image/jpeg' : extension === '.m4a' ? 'audio/mp4' : extension === '.webm' ? job.format === 'audio-best' ? 'audio/webm' : 'video/webm' : 'video/mp4'
+    const mime = extension === '.mp3' ? 'audio/mpeg' : extension === '.jpg' || extension === '.jpeg' ? 'image/jpeg' : extension === '.png' ? 'image/png' : extension === '.webp' ? 'image/webp' : extension === '.zip' ? 'application/zip' : extension === '.m4a' ? 'audio/mp4' : extension === '.webm' ? job.format === 'audio-best' ? 'audio/webm' : 'video/webm' : 'video/mp4'
     res.writeHead(200, {
       'Content-Type': mime,
       'Content-Length': job.size,
