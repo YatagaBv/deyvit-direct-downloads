@@ -29,7 +29,6 @@ const formats = {
   photos: [],
 }
 const jobs = new Map()
-const requests = []
 let active = 0
 
 export function sourcePlatform(raw) {
@@ -164,14 +163,10 @@ export const server = createServer(async (req, res) => {
   if (req.method === 'OPTIONS') { res.writeHead(204); return res.end() }
 
   if (pathname === '/api/dl/prepare' && req.method === 'POST') {
-    const now = Date.now()
-    while (requests.length && requests[0] < now - 3600000) requests.shift()
-    if (requests.length >= 60) return json(res, 429, { error: 'Se alcanzó el límite gratuito de descargas de esta hora.' })
     if (active >= 1) return json(res, 429, { error: 'Hay una descarga en preparación. Inténtalo de nuevo en un momento.' })
     if (!existsSync(binary) || !existsSync(ffmpeg)) return json(res, 503, { error: 'El motor de descarga todavía no está listo.' })
     let dir
     active++
-    requests.push(now)
     try {
       const body = await bodyJson(req)
       const url = String(body.url || '')
