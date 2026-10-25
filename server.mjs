@@ -22,7 +22,8 @@ const formats = {
   hd: ['-f', 'bv*[height<=720]+ba/b[height<=720]', '--merge-output-format', 'mp4'],
   sd: ['-f', 'b[height<=480]/bv*[height<=480]+ba', '--merge-output-format', 'mp4'],
   video: ['-f', 'b/bv*+ba', '--merge-output-format', 'mp4'],
-  audio: ['-f', 'ba/bestaudio', '-x', '--audio-format', 'mp3'],
+  audio: ['-f', 'ba/bestaudio', '-x', '--audio-format', 'mp3', '--audio-quality', '0'],
+  'audio-best': ['-f', 'ba/bestaudio'],
   jpg: ['--skip-download', '--write-thumbnail', '--convert-thumbnails', 'jpg'],
 }
 const jobs = new Map()
@@ -73,9 +74,10 @@ function expire(id) {
 function errorMessage(error) {
   const text = error instanceof Error ? error.message : String(error)
   if (/403|challenge|blocked|Unexpected response/i.test(text)) return 'La plataforma bloqueó temporalmente la descarga de este video.'
-  if (/private|sign in|login required/i.test(text)) return 'Este video es privado o requiere iniciar sesión en la plataforma.'
+  if (/sign in to confirm|not a bot|login required|sign in/i.test(text)) return 'YouTube exige verificación o inicio de sesión desde este servidor; no puedo descargar este enlace aquí.'
+  if (/private/i.test(text)) return 'Este video es privado o requiere permiso de acceso.'
   if (/timed out|timeout|tardó/i.test(text)) return 'La plataforma tardó demasiado en responder.'
-  if (/Requested format is not available/i.test(text)) return 'Esa calidad no está disponible para este video. Prueba «mejor disponible».'
+  if (/Requested format is not available/i.test(text)) return 'Esa calidad no está disponible para este video. Prueba «Calidad original».'
   return text.replace(/^ERROR:\s*/i, '').slice(0, 220)
 }
 
@@ -83,7 +85,7 @@ function runDownload(url, format, dir) {
   return new Promise((resolve, reject) => {
     const args = [
       '--ignore-config', '--no-playlist', '--no-warnings', '--socket-timeout', '12',
-      '--retries', '1', '--max-filesize', '150M', '--ffmpeg-location', ffmpeg,
+      '--retries', '1', '--ffmpeg-location', ffmpeg,
       '-P', dir, '-o', 'download.%(ext)s', ...formats[format], '--', url,
     ]
     const child = spawn(binary, args, { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true })
@@ -144,12 +146,14 @@ export const server = createServer(async (req, res) => {
       if (!filename) throw new Error('La plataforma no entregó un archivo descargable.')
       const file = path.join(dir, filename)
       const size = statSync(file).size
-      if (size < 1024 || size > 150 * 1024 * 1024) throw new Error('El archivo está vacío o supera el límite gratuito de 150 MB.')
+      if (size < 1024) throw new Error('La plataforma entregó un archivo vacío.')
       const id = randomUUID()
       const timer = setTimeout(() => expire(id), 10 * 60000)
-      jobs.set(id, { dir, file, size, timer })
+      const shortPlatform = { youtube: 'yt', tiktok: 'tt', instagram: 'ig' }[platform]
+      const downloadName = `dei bv ${shortPlatform}${path.extname(file)}`
+      jobs.set(id, { dir, file, size, timer, downloadName, format })
       dir = undefined
-      return json(res, 200, { token: id, size, filename: `deyvit-${platform}${path.extname(file)}` })
+      return json(res, 200, { token: id, size, filename: downloadName })
     } catch (error) {
       return json(res, 422, { error: errorMessage(error) })
     } finally {
@@ -163,11 +167,11 @@ export const server = createServer(async (req, res) => {
     const job = jobs.get(match[1])
     if (!job) return json(res, 404, { error: 'La descarga expiró. Prepárala otra vez.' })
     const extension = path.extname(job.file).toLowerCase()
-    const mime = extension === '.mp3' ? 'audio/mpeg' : extension === '.jpg' || extension === '.jpeg' ? 'image/jpeg' : extension === '.m4a' ? 'audio/mp4' : extension === '.webm' ? 'video/webm' : 'video/mp4'
+    const mime = extension === '.mp3' ? 'audio/mpeg' : extension === '.jpg' || extension === '.jpeg' ? 'image/jpeg' : extension === '.m4a' ? 'audio/mp4' : extension === '.webm' ? job.format === 'audio-best' ? 'audio/webm' : 'video/webm' : 'video/mp4'
     res.writeHead(200, {
       'Content-Type': mime,
       'Content-Length': job.size,
-      'Content-Disposition': `attachment; filename="deyvit-descarga${extension}"`,
+      'Content-Disposition': `attachment; filename="${job.downloadName}"`,
       'Cache-Control': 'private, no-store',
       'X-Content-Type-Options': 'nosniff',
     })
