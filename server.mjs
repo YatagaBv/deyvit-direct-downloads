@@ -206,6 +206,9 @@ export const server = createServer(async (req, res) => {
       dir = undefined
       return json(res, 200, { token: id, size, filename: downloadName })
     } catch (error) {
+      if (/pinterest_.*\.mp4/i.test(String(error))) {
+        return json(res, 422, { error: 'Este pin contiene un video. Elige MP4.' })
+      }
       return json(res, 422, { error: errorMessage(error) })
     } finally {
       active--
