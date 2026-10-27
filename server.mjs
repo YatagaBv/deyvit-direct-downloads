@@ -83,12 +83,14 @@ function errorMessage(error) {
   return text.replace(/^ERROR:\s*/i, '').slice(0, 220)
 }
 
-function runDownload(url, format, dir) {
+function runDownload(url, format, dir, youtubeClients = '') {
   return new Promise((resolve, reject) => {
     const args = [
       '--ignore-config', '--no-playlist', '--no-warnings', '--socket-timeout', '12',
       '--retries', '1', '--ffmpeg-location', ffmpeg,
-      '-P', dir, '-o', 'download.%(ext)s', ...formats[format], '--', url,
+      '-P', dir, '-o', 'download.%(ext)s', ...formats[format],
+      ...(youtubeClients ? ['--extractor-args', `youtube:player_client=${youtubeClients}`] : []),
+      '--', url,
     ]
     const child = spawn(binary, args, { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true })
     let stderr = ''
@@ -163,7 +165,7 @@ export const server = createServer(async (req, res) => {
   if (req.method === 'OPTIONS') { res.writeHead(204); return res.end() }
 
   if (pathname === '/api/dl/prepare' && req.method === 'POST') {
-    if (active >= 1) return json(res, 429, { error: 'Hay una descarga en preparación. Inténtalo de nuevo en un momento.' })
+    if (active >= 2) return json(res, 429, { error: 'Hay dos descargas en preparación. Inténtalo de nuevo en un momento.' })
     if (!existsSync(binary) || !existsSync(ffmpeg)) return json(res, 503, { error: 'El motor de descarga todavía no está listo.' })
     let dir
     active++
@@ -182,7 +184,14 @@ export const server = createServer(async (req, res) => {
       if (galleryMode && !existsSync(path.join(root, 'vendor', 'gallery_dl'))) return json(res, 503, { error: 'El motor de imágenes todavía no está instalado.' })
       dir = mkdtempSync(path.join(tmpdir(), 'deyvit-dl-'))
       if (galleryMode) await runGallery(url, dir)
-      else await runDownload(url, format, dir)
+      else {
+        try {
+          await runDownload(url, format, dir)
+        } catch (error) {
+          if (platform !== 'youtube' || !/sign in|not a bot|login required|verification|verificaci/i.test(String(error))) throw error
+          await runDownload(url, format, dir, 'android_vr,web_embedded')
+        }
+      }
       const imageFiles = galleryMode ? downloadedImages(dir) : []
       const filename = galleryMode ? imageFiles.length === 1 ? imageFiles[0] : imageFiles.length > 1 ? await packImages(dir, imageFiles) : '' : readdirSync(dir).find(name => /^download\.(mp4|mkv|webm|mp3|m4a|jpg|jpeg)$/i.test(name))
       if (!filename) throw new Error('La plataforma no entregó un archivo descargable.')
