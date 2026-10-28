@@ -10,7 +10,7 @@ const root = path.dirname(fileURLToPath(import.meta.url))
 const binary = process.env.YT_DLP_PATH || path.join(root, 'bin', process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp')
 const ffmpeg = process.env.FFMPEG_PATH || path.join(root, 'node_modules', 'ffmpeg-static', process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg')
 const potMain = path.join(root, 'pot-provider', 'server', 'build', 'main.js')
-const potPlugin = path.join(root, 'pot-provider', 'plugin')
+const potPlugin = path.join(root, 'pot-provider')
 const port = Number(process.env.PORT || 8080)
 let potReady = false
 const allowedOrigins = new Set([
@@ -107,8 +107,8 @@ function expire(id) {
 
 function errorMessage(error) {
   const text = error instanceof Error ? error.message : String(error)
-  if (/403|challenge|blocked|Unexpected response/i.test(text)) return 'La plataforma bloqueó temporalmente la descarga de este video.'
   if (/sign in to confirm|not a bot|login required|sign in/i.test(text)) return 'YouTube exige verificación o inicio de sesión desde este servidor; no puedo descargar este enlace aquí.'
+  if (/403|challenge|blocked|Unexpected response/i.test(text)) return 'La plataforma bloqueó temporalmente la descarga de este video.'
   if (/private/i.test(text)) return 'Este video es privado o requiere permiso de acceso.'
   if (/timed out|timeout|tardó/i.test(text)) return 'La plataforma tardó demasiado en responder.'
   if (/Requested format is not available/i.test(text)) return 'Esa calidad no está disponible para este video. Prueba «Calidad original».'
