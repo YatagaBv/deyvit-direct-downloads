@@ -9,7 +9,10 @@ import { fileURLToPath } from 'node:url'
 const root = path.dirname(fileURLToPath(import.meta.url))
 const binary = process.env.YT_DLP_PATH || path.join(root, 'bin', process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp')
 const ffmpeg = process.env.FFMPEG_PATH || path.join(root, 'node_modules', 'ffmpeg-static', process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg')
+const potMain = path.join(root, 'pot-provider', 'server', 'build', 'main.js')
+const potPlugin = path.join(root, 'pot-provider', 'plugin')
 const port = Number(process.env.PORT || 8080)
+let potReady = false
 const allowedOrigins = new Set([
   'https://deyvit-blog.surge.sh',
   'https://yatagabv.blogspot.com',
@@ -117,6 +120,7 @@ function runDownload(url, format, dir, youtubeClients = '', ipv4 = false) {
     const args = [
       '--ignore-config', '--no-playlist', '--no-warnings', '--js-runtimes', 'node', '--socket-timeout', '12',
       '--retries', '1', '--ffmpeg-location', ffmpeg,
+      ...(potReady ? ['--plugin-dirs', potPlugin] : []),
       ...(ipv4 ? ['--force-ipv4'] : []),
       '-P', dir, '-o', 'download.%(ext)s', ...formats[format],
       ...(youtubeClients ? ['--extractor-args', `youtube:player_client=${youtubeClients}`] : []),
@@ -187,7 +191,7 @@ async function bodyJson(req) {
 
 export const server = createServer(async (req, res) => {
   const pathname = new URL(req.url || '/', 'http://localhost').pathname
-  if (pathname === '/health' && req.method === 'GET') return json(res, 200, { ok: true, engine: existsSync(binary) && existsSync(ffmpeg), gallery: existsSync(path.join(root, 'vendor', 'gallery_dl')) })
+  if (pathname === '/health' && req.method === 'GET') return json(res, 200, { ok: true, engine: existsSync(binary) && existsSync(ffmpeg), gallery: existsSync(path.join(root, 'vendor', 'gallery_dl')), youtubeTokenProvider: potReady })
   const origin = String(req.headers.origin || '')
   const isFileDownload = req.method === 'GET' && /^\/api\/dl\/file\/[a-f0-9-]{36}$/.test(pathname)
   if (origin && !cors(res, origin)) return json(res, 403, { error: 'Origen no permitido.' })
@@ -217,7 +221,7 @@ export const server = createServer(async (req, res) => {
       if (galleryMode) await runGallery(url, dir)
       else {
         try {
-          await runDownload(url, format, dir)
+          await runDownload(url, format, dir, platform === 'youtube' && potReady ? 'mweb' : '')
         } catch (error) {
           if (platform !== 'youtube' || !/sign in|not a bot|login required|verification|verificaci/i.test(String(error))) throw error
           await runDownload(url, format, dir, 'android_vr,web_embedded', true)
@@ -268,5 +272,17 @@ export const server = createServer(async (req, res) => {
 })
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  server.listen(port, '0.0.0.0', () => console.log(`Descargas directas listas en puerto ${port}`))
+  if (existsSync(potMain) && existsSync(potPlugin)) {
+    const provider = spawn(process.execPath, [potMain], { stdio: 'ignore', windowsHide: true })
+    provider.on('error', () => { potReady = false })
+    provider.on('exit', () => { potReady = false })
+    for (let attempt = 0; attempt < 20; attempt++) {
+      try {
+        const response = await fetch('http://127.0.0.1:4416/ping', { signal: AbortSignal.timeout(1000) })
+        if (response.ok) { potReady = true; break }
+      } catch { /* el proveedor aún está iniciando */ }
+      await new Promise(resolve => setTimeout(resolve, 500))
+    }
+  }
+  server.listen(port, '0.0.0.0', () => console.log(`Descargas directas listas en puerto ${port}; token YouTube: ${potReady}`))
 }
