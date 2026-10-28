@@ -4,6 +4,6 @@
   "version": "1.0.0",
   "type": "module",
   "engines": { "node": ">=20" },
-  "scripts": { "start": "node server.mjs", "test": "node --test server.test.mjs", "postinstall": "python3 -m pip install --disable-pip-version-check --no-input --target vendor gallery-dl==1.32.17 && (test -d pot-provider || git clone --depth 1 --branch 2.0.2 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git pot-provider) && cd pot-provider/server && npm ci --include=dev && ./node_modules/.bin/tsc" },
+  "scripts": { "start": "node server.mjs", "test": "node --test server.test.mjs", "postinstall": "python3 -m pip install --disable-pip-version-check --no-input --target vendor gallery-dl==1.32.17 && mkdir -p pot-provider && curl -fL --retry 3 https://codeload.github.com/Brainicism/bgutil-ytdlp-pot-provider/tar.gz/refs/tags/2.0.2 | tar -xz -C pot-provider --strip-components=1 && cd pot-provider/server && npm ci --include=dev && ./node_modules/.bin/tsc" },
   "dependencies": { "ffmpeg-static": "5.3.0" }
 }
