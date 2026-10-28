@@ -273,16 +273,21 @@ export const server = createServer(async (req, res) => {
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   if (existsSync(potMain) && existsSync(potPlugin)) {
-    const provider = spawn(process.execPath, [potMain], { stdio: 'ignore', windowsHide: true })
-    provider.on('error', () => { potReady = false })
-    provider.on('exit', () => { potReady = false })
-    for (let attempt = 0; attempt < 20; attempt++) {
+    const provider = spawn(process.execPath, [potMain, '--host', '127.0.0.1'], { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true })
+    let providerError = ''
+    provider.stderr.on('data', chunk => { providerError = (providerError + String(chunk)).slice(-1000) })
+    provider.on('error', error => { potReady = false; console.error('Proveedor YouTube:', error.message) })
+    provider.on('exit', code => { potReady = false; console.error('Proveedor YouTube terminó:', code, providerError) })
+    for (let attempt = 0; attempt < 60; attempt++) {
       try {
         const response = await fetch('http://127.0.0.1:4416/ping', { signal: AbortSignal.timeout(1000) })
         if (response.ok) { potReady = true; break }
       } catch { /* el proveedor aún está iniciando */ }
       await new Promise(resolve => setTimeout(resolve, 500))
     }
+    if (!potReady) console.error('Proveedor YouTube no respondió:', providerError || 'sin diagnóstico')
+  } else {
+    console.error('Proveedor YouTube no se instaló durante la compilación.')
   }
   server.listen(port, '0.0.0.0', () => console.log(`Descargas directas listas en puerto ${port}; token YouTube: ${potReady}`))
 }
