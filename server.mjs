@@ -118,7 +118,7 @@ function errorMessage(error) {
 function runDownload(url, format, dir, youtubeClients = '', ipv4 = false) {
   return new Promise((resolve, reject) => {
     const args = [
-      '--ignore-config', '--no-playlist', '--no-warnings', '--js-runtimes', 'node', '--socket-timeout', '12',
+      '--ignore-config', '--no-playlist', '--verbose', '--js-runtimes', 'node', '--socket-timeout', '12',
       '--retries', '1', '--ffmpeg-location', ffmpeg,
       ...(potReady ? ['--plugin-dirs', potPlugin] : []),
       ...(ipv4 ? ['--force-ipv4'] : []),
@@ -139,7 +139,7 @@ function runDownload(url, format, dir, youtubeClients = '', ipv4 = false) {
     const timer = setTimeout(() => { child.kill(); finish(new Error('El video tardó demasiado en procesarse.')) }, 300000)
     child.stderr.on('data', chunk => { stderr = (stderr + String(chunk)).slice(-4000) })
     child.on('error', finish)
-    child.on('close', code => finish(code === 0 ? null : new Error(stderr.trim().split('\n').at(-1) || 'No se pudo procesar el enlace.')))
+    child.on('close', code => finish(code === 0 ? null : new Error(stderr.trim() || 'No se pudo procesar el enlace.')))
   })
 }
 
@@ -223,8 +223,13 @@ export const server = createServer(async (req, res) => {
         try {
           await runDownload(url, format, dir, platform === 'youtube' && potReady ? 'mweb' : '')
         } catch (error) {
+          if (platform === 'youtube') console.error('YouTube, primer intento:', String(error).slice(-4000))
           if (platform !== 'youtube' || !/sign in|not a bot|login required|verification|verificaci/i.test(String(error))) throw error
-          await runDownload(url, format, dir, 'android_vr,web_embedded', true)
+          try { await runDownload(url, format, dir, 'android_vr,web_embedded', true) }
+          catch (fallbackError) {
+            console.error('YouTube, segundo intento:', String(fallbackError).slice(-4000))
+            throw fallbackError
+          }
         }
       }
       const imageFiles = galleryMode ? downloadedImages(dir) : []
@@ -291,3 +296,4 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   }
   server.listen(port, '0.0.0.0', () => console.log(`Descargas directas listas en puerto ${port}; token YouTube: ${potReady}`))
 }
+
