@@ -21,15 +21,44 @@ const formats = {
   fhd: ['-f', 'bv*[height<=1080]+ba/b[height<=1080]', '--merge-output-format', 'mp4'],
   hd: ['-f', 'bv*[height<=720]+ba/b[height<=720]', '--merge-output-format', 'mp4'],
   sd: ['-f', 'b[height<=480]/bv*[height<=480]+ba', '--merge-output-format', 'mp4'],
+  p360: ['-f', 'bv*[height<=360]+ba/b[height<=360]', '--merge-output-format', 'mp4'],
+  p240: ['-f', 'bv*[height<=240]+ba/b[height<=240]', '--merge-output-format', 'mp4'],
+  p144: ['-f', 'bv*[height<=144]+ba/b[height<=144]', '--merge-output-format', 'mp4'],
   video: ['-f', 'b/bv*+ba', '--merge-output-format', 'mp4'],
   audio: ['-f', 'ba/bestaudio', '-x', '--audio-format', 'mp3', '--audio-quality', '0'],
   'audio-best': ['-f', 'ba/bestaudio'],
+  m4a: ['-f', 'ba/bestaudio', '-x', '--audio-format', 'm4a'],
   jpg: ['--skip-download', '--write-thumbnail', '--convert-thumbnails', 'jpg'],
   image: [],
   photos: [],
 }
 const jobs = new Map()
 let active = 0
+const waiting = []
+
+function reserveSlot() {
+  if (active < 2) { active++; return Promise.resolve() }
+  if (waiting.length >= 8) return Promise.reject(new Error('El descargador está ocupado. Vuelve a intentarlo en un momento.'))
+  return new Promise((resolve, reject) => {
+    const entry = { resolve, timer: undefined }
+    entry.timer = setTimeout(() => {
+      const index = waiting.indexOf(entry)
+      if (index !== -1) waiting.splice(index, 1)
+      reject(new Error('La espera fue demasiado larga. Vuelve a intentarlo.'))
+    }, 90000)
+    waiting.push(entry)
+  })
+}
+
+function releaseSlot() {
+  active--
+  const next = waiting.shift()
+  if (next) {
+    clearTimeout(next.timer)
+    active++
+    next.resolve()
+  }
+}
 
 export function sourcePlatform(raw) {
   try {
@@ -83,11 +112,12 @@ function errorMessage(error) {
   return text.replace(/^ERROR:\s*/i, '').slice(0, 220)
 }
 
-function runDownload(url, format, dir, youtubeClients = '') {
+function runDownload(url, format, dir, youtubeClients = '', ipv4 = false) {
   return new Promise((resolve, reject) => {
     const args = [
-      '--ignore-config', '--no-playlist', '--no-warnings', '--socket-timeout', '12',
+      '--ignore-config', '--no-playlist', '--no-warnings', '--js-runtimes', 'node', '--socket-timeout', '12',
       '--retries', '1', '--ffmpeg-location', ffmpeg,
+      ...(ipv4 ? ['--force-ipv4'] : []),
       '-P', dir, '-o', 'download.%(ext)s', ...formats[format],
       ...(youtubeClients ? ['--extractor-args', `youtube:player_client=${youtubeClients}`] : []),
       '--', url,
@@ -165,10 +195,9 @@ export const server = createServer(async (req, res) => {
   if (req.method === 'OPTIONS') { res.writeHead(204); return res.end() }
 
   if (pathname === '/api/dl/prepare' && req.method === 'POST') {
-    if (active >= 2) return json(res, 429, { error: 'Hay dos descargas en preparación. Inténtalo de nuevo en un momento.' })
     if (!existsSync(binary) || !existsSync(ffmpeg)) return json(res, 503, { error: 'El motor de descarga todavía no está listo.' })
     let dir
-    active++
+    let reserved = false
     try {
       const body = await bodyJson(req)
       const url = String(body.url || '')
@@ -182,6 +211,8 @@ export const server = createServer(async (req, res) => {
       if (!platform || !Object.hasOwn(formats, format)) return json(res, 400, { error: 'Usa un enlace público HTTPS de YouTube, TikTok, Instagram o Pinterest.' })
       const galleryMode = format === 'image' || format === 'photos'
       if (galleryMode && !existsSync(path.join(root, 'vendor', 'gallery_dl'))) return json(res, 503, { error: 'El motor de imágenes todavía no está instalado.' })
+      await reserveSlot()
+      reserved = true
       dir = mkdtempSync(path.join(tmpdir(), 'deyvit-dl-'))
       if (galleryMode) await runGallery(url, dir)
       else {
@@ -189,7 +220,7 @@ export const server = createServer(async (req, res) => {
           await runDownload(url, format, dir)
         } catch (error) {
           if (platform !== 'youtube' || !/sign in|not a bot|login required|verification|verificaci/i.test(String(error))) throw error
-          await runDownload(url, format, dir, 'android_vr,web_embedded')
+          await runDownload(url, format, dir, 'android_vr,web_embedded', true)
         }
       }
       const imageFiles = galleryMode ? downloadedImages(dir) : []
@@ -201,7 +232,7 @@ export const server = createServer(async (req, res) => {
       const id = randomUUID()
       const timer = setTimeout(() => expire(id), 10 * 60000)
       const shortPlatform = { youtube: 'yt', tiktok: 'tt', instagram: 'ig', pinterest: 'pin' }[platform]
-      const downloadName = `dei bv ${shortPlatform}${path.extname(file)}`
+      const downloadName = `dei v ${shortPlatform}${path.extname(file)}`
       jobs.set(id, { dir, file, size, timer, downloadName, format })
       dir = undefined
       return json(res, 200, { token: id, size, filename: downloadName })
@@ -211,7 +242,7 @@ export const server = createServer(async (req, res) => {
       }
       return json(res, 422, { error: errorMessage(error) })
     } finally {
-      active--
+      if (reserved) releaseSlot()
       if (dir) removeTemp(dir)
     }
   }
@@ -239,4 +270,3 @@ export const server = createServer(async (req, res) => {
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   server.listen(port, '0.0.0.0', () => console.log(`Descargas directas listas en puerto ${port}`))
 }
-
