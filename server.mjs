@@ -221,14 +221,19 @@ export const server = createServer(async (req, res) => {
       if (galleryMode) await runGallery(url, dir)
       else {
         try {
-          await runDownload(url, format, dir, platform === 'youtube' && potReady ? 'mweb' : '')
+          await runDownload(url, format, dir)
         } catch (error) {
           if (platform === 'youtube') console.error('YouTube, primer intento:', String(error).slice(-4000))
-          if (platform !== 'youtube' || !/sign in|not a bot|login required|verification|verificaci/i.test(String(error))) throw error
-          try { await runDownload(url, format, dir, 'android_vr,web_embedded', true) }
+          if (platform !== 'youtube' || !/sign in|not a bot|login required|verification|verificaci|403/i.test(String(error))) throw error
+          try { await runDownload(url, format, dir, 'mweb') }
           catch (fallbackError) {
             console.error('YouTube, segundo intento:', String(fallbackError).slice(-4000))
-            throw fallbackError
+            if (!/sign in|not a bot|login required|verification|verificaci|403/i.test(String(fallbackError))) throw fallbackError
+            try { await runDownload(url, format, dir, 'android_vr,web_embedded', true) }
+            catch (lastError) {
+              console.error('YouTube, tercer intento:', String(lastError).slice(-4000))
+              throw lastError
+            }
           }
         }
       }
