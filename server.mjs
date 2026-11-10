@@ -36,6 +36,8 @@ const formats = {
   photos: [],
 }
 const jobs = new Map()
+const prepared = new Map()
+const failures = new Map()
 let active = 0
 const waiting = []
 
@@ -100,7 +102,9 @@ function removeTemp(dir) {
 function expire(id) {
   const job = jobs.get(id)
   if (!job) return
+  if (job.readers) { job.timer = setTimeout(() => expire(id), 30000); return }
   jobs.delete(id)
+  if (prepared.get(job.key) === id) prepared.delete(job.key)
   clearTimeout(job.timer)
   removeTemp(job.dir)
 }
@@ -111,15 +115,15 @@ function errorMessage(error) {
   if (/403|challenge|blocked|Unexpected response/i.test(text)) return 'La plataforma bloqueó temporalmente la descarga de este video.'
   if (/private/i.test(text)) return 'Este video es privado o requiere permiso de acceso.'
   if (/timed out|timeout|tardó/i.test(text)) return 'La plataforma tardó demasiado en responder.'
-  if (/Requested format is not available/i.test(text)) return 'Esa calidad no está disponible para este video. Prueba «Calidad original».'
+  if (/Requested format is not available/i.test(text)) return 'Ese formato no está disponible para este video. Prueba otro formato.'
   return text.replace(/^ERROR:\s*/i, '').slice(0, 220)
 }
 
 function runDownload(url, format, dir, youtubeClients = '', ipv4 = false) {
   return new Promise((resolve, reject) => {
     const args = [
-      '--ignore-config', '--no-playlist', '--verbose', '--js-runtimes', 'node', '--socket-timeout', '12',
-      '--retries', '1', '--ffmpeg-location', ffmpeg,
+      '--ignore-config', '--no-playlist', '--verbose', '--js-runtimes', 'node', '--socket-timeout', '8',
+      '--retries', '0', '--ffmpeg-location', ffmpeg,
       ...(potReady ? ['--plugin-dirs', potPlugin] : []),
       ...(ipv4 ? ['--force-ipv4'] : []),
       '-P', dir, '-o', 'download.%(ext)s', ...formats[format],
@@ -190,8 +194,9 @@ async function bodyJson(req) {
 }
 
 export const server = createServer(async (req, res) => {
-  const pathname = new URL(req.url || '/', 'http://localhost').pathname
-  if (pathname === '/health' && req.method === 'GET') return json(res, 200, { ok: true, engine: existsSync(binary) && existsSync(ffmpeg), gallery: existsSync(path.join(root, 'vendor', 'gallery_dl')), youtubeTokenProvider: potReady })
+  const requestUrl = new URL(req.url || '/', 'http://localhost')
+  const { pathname } = requestUrl
+  if (pathname === '/health' && req.method === 'GET') return json(res, 200, { ok: true, engine: existsSync(binary) && existsSync(ffmpeg), gallery: existsSync(path.join(root, 'vendor', 'gallery_dl')), youtubeTokenProvider: potReady, revision: '2026-11-10-cache-v1' })
   const origin = String(req.headers.origin || '')
   const isFileDownload = req.method === 'GET' && /^\/api\/dl\/file\/[a-f0-9-]{36}$/.test(pathname)
   if (origin && !cors(res, origin)) return json(res, 403, { error: 'Origen no permitido.' })
@@ -202,9 +207,10 @@ export const server = createServer(async (req, res) => {
     if (!existsSync(binary) || !existsSync(ffmpeg)) return json(res, 503, { error: 'El motor de descarga todavía no está listo.' })
     let dir
     let reserved = false
+    let requestKey
     try {
       const body = await bodyJson(req)
-      const url = String(body.url || '')
+      let url = String(body.url || '')
       const platform = sourcePlatform(url)
       let format = String(body.format || '')
       const isPhoto = platform === 'tiktok' && /\/photo\/\d+/.test(new URL(url).pathname)
@@ -213,29 +219,33 @@ export const server = createServer(async (req, res) => {
       if (platform === 'instagram' && format !== 'audio' && format !== 'jpg') format = 'video'
       if (platform === 'pinterest' && format !== 'image') format = 'video'
       if (!platform || !Object.hasOwn(formats, format)) return json(res, 400, { error: 'Usa un enlace público HTTPS de YouTube, TikTok, Instagram o Pinterest.' })
+      const canonical = new URL(url)
+      canonical.hash = ''
+      for (const parameter of ['utm_source', 'utm_medium', 'utm_campaign', 'si', 'igsh', 'list', 'start_radio']) canonical.searchParams.delete(parameter)
+      url = canonical.href
+      const key = JSON.stringify([url, format])
+      requestKey = key
+      const failed = failures.get(key)
+      if (failed && failed.until > Date.now()) return json(res, 422, { error: failed.message })
+      failures.delete(key)
+      const lookup = () => {
+        const token = prepared.get(key)
+        const job = token && jobs.get(token)
+        return job ? { token, size: job.size, filename: job.downloadName } : null
+      }
+      const cached = lookup()
+      if (cached) return json(res, 200, cached)
       const galleryMode = format === 'image' || format === 'photos'
       if (galleryMode && !existsSync(path.join(root, 'vendor', 'gallery_dl'))) return json(res, 503, { error: 'El motor de imágenes todavía no está instalado.' })
       await reserveSlot()
       reserved = true
+      const reused = lookup()
+      if (reused) return json(res, 200, reused)
       dir = mkdtempSync(path.join(tmpdir(), 'deyvit-dl-'))
       if (galleryMode) await runGallery(url, dir)
       else {
-        try {
-          await runDownload(url, format, dir)
-        } catch (error) {
-          if (platform === 'youtube') console.error('YouTube, primer intento:', String(error).slice(-4000))
-          if (platform !== 'youtube' || !/sign in|not a bot|login required|verification|verificaci|403/i.test(String(error))) throw error
-          try { await runDownload(url, format, dir, 'mweb') }
-          catch (fallbackError) {
-            console.error('YouTube, segundo intento:', String(fallbackError).slice(-4000))
-            if (!/sign in|not a bot|login required|verification|verificaci|403/i.test(String(fallbackError))) throw fallbackError
-            try { await runDownload(url, format, dir, 'android_vr,web_embedded', true) }
-            catch (lastError) {
-              console.error('YouTube, tercer intento:', String(lastError).slice(-4000))
-              throw lastError
-            }
-          }
-        }
+        // Repeating an authentication rejection cannot authorize this server.
+        await runDownload(url, format, dir)
       }
       const imageFiles = galleryMode ? downloadedImages(dir) : []
       const filename = galleryMode ? imageFiles.length === 1 ? imageFiles[0] : imageFiles.length > 1 ? await packImages(dir, imageFiles) : '' : readdirSync(dir).find(name => /^download\.(mp4|mkv|webm|mp3|m4a|jpg|jpeg)$/i.test(name))
@@ -244,13 +254,23 @@ export const server = createServer(async (req, res) => {
       const size = statSync(file).size
       if (size < 1024) throw new Error('La plataforma entregó un archivo vacío.')
       const id = randomUUID()
-      const timer = setTimeout(() => expire(id), 10 * 60000)
+      const timer = setTimeout(() => expire(id), 3 * 60000)
       const shortPlatform = { youtube: 'yt', tiktok: 'tt', instagram: 'ig', pinterest: 'pin' }[platform]
       const downloadName = `dei v ${shortPlatform}${path.extname(file)}`
-      jobs.set(id, { dir, file, size, timer, downloadName, format })
+      jobs.set(id, { dir, file, size, timer, downloadName, format, key })
+      prepared.set(key, id)
+      while (jobs.size > 6 || (jobs.size > 1 && [...jobs.values()].reduce((total, job) => total + job.size, 0) > 180 * 1024 * 1024)) {
+        const candidate = [...jobs.entries()].find(([candidate, job]) => candidate !== id && !job.readers)?.[0]
+        if (!candidate) break
+        expire(candidate)
+      }
       dir = undefined
       return json(res, 200, { token: id, size, filename: downloadName })
     } catch (error) {
+      if (requestKey && /sign in|not a bot|login required|verification|403/i.test(String(error))) {
+        if (failures.size >= 100) failures.delete(failures.keys().next().value)
+        failures.set(requestKey, { until: Date.now() + 30000, message: errorMessage(error) })
+      }
       if (/pinterest_.*\.mp4/i.test(String(error))) {
         return json(res, 422, { error: 'Este pin contiene un video. Elige MP4.' })
       }
@@ -267,15 +287,18 @@ export const server = createServer(async (req, res) => {
     if (!job) return json(res, 404, { error: 'La descarga expiró. Prepárala otra vez.' })
     const extension = path.extname(job.file).toLowerCase()
     const mime = extension === '.mp3' ? 'audio/mpeg' : extension === '.jpg' || extension === '.jpeg' ? 'image/jpeg' : extension === '.png' ? 'image/png' : extension === '.webp' ? 'image/webp' : extension === '.zip' ? 'application/zip' : extension === '.m4a' ? 'audio/mp4' : extension === '.webm' ? job.format === 'audio-best' ? 'audio/webm' : 'video/webm' : 'video/mp4'
+    const customName = (requestUrl.searchParams.get('name') || '').replace(/[^\p{L}\p{N} _.-]/gu, '').trim().replace(/^\.+|[. ]+$/g, '').slice(0, 80)
+    const filename = customName ? customName + extension : job.downloadName
     res.writeHead(200, {
       'Content-Type': mime,
       'Content-Length': job.size,
-      'Content-Disposition': `attachment; filename="${job.downloadName}"`,
+      'Content-Disposition': `attachment; filename="${job.downloadName}"; filename*=UTF-8''${encodeURIComponent(filename)}`,
       'Cache-Control': 'private, no-store',
       'X-Content-Type-Options': 'nosniff',
     })
+    job.readers = (job.readers || 0) + 1
+    res.once('close', () => { job.readers = Math.max(0, job.readers - 1) })
     createReadStream(job.file).on('error', () => res.destroy()).pipe(res)
-    res.once('close', () => expire(match[1]))
     return
   }
   json(res, 404, { error: 'Ruta no encontrada.' })
