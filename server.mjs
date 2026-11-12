@@ -9,10 +9,7 @@ import { fileURLToPath } from 'node:url'
 const root = path.dirname(fileURLToPath(import.meta.url))
 const binary = process.env.YT_DLP_PATH || path.join(root, 'bin', process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp')
 const ffmpeg = process.env.FFMPEG_PATH || path.join(root, 'node_modules', 'ffmpeg-static', process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg')
-const potMain = path.join(root, 'pot-provider', 'server', 'build', 'main.js')
-const potPlugin = path.join(root, 'pot-provider')
 const port = Number(process.env.PORT || 8080)
-let potReady = false
 const allowedOrigins = new Set([
   'https://deyvit-blog.surge.sh',
   'https://yatagabv.blogspot.com',
@@ -71,8 +68,6 @@ export function sourcePlatform(raw) {
     const url = new URL(raw)
     if (url.protocol !== 'https:' || url.username || url.password || url.port || raw.length > 1200) return null
     const host = url.hostname.toLowerCase().replace(/\.$/, '')
-    if ((host === 'youtube.com' || host === 'www.youtube.com' || host === 'm.youtube.com') && /^\/(watch|shorts\/|live\/)/.test(url.pathname)) return 'youtube'
-    if (host === 'youtu.be' && /^\/[\w-]{6,}/.test(url.pathname)) return 'youtube'
     if ((host === 'tiktok.com' || host === 'www.tiktok.com' || host === 'm.tiktok.com') && /^\/@[^/]+\/(video|photo)\/\d+/.test(url.pathname)) return 'tiktok'
     if ((host === 'instagram.com' || host === 'www.instagram.com') && /^\/(reel|reels|p)\/[\w-]+/.test(url.pathname)) return 'instagram'
     if ((host === 'pinterest.com' || host.endsWith('.pinterest.com')) && /^\/pin\/(?:[\w-]+--)?\d+\/?$/.test(url.pathname)) return 'pinterest'
@@ -197,7 +192,7 @@ async function bodyJson(req) {
 export const server = createServer(async (req, res) => {
   const requestUrl = new URL(req.url || '/', 'http://localhost')
   const { pathname } = requestUrl
-  if (pathname === '/health' && req.method === 'GET') return json(res, 200, { ok: true, engine: existsSync(binary) && existsSync(ffmpeg), gallery: existsSync(path.join(root, 'vendor', 'gallery_dl')), youtubeTokenProvider: potReady, revision: '2026-11-12-download-v2' })
+  if (pathname === '/health' && req.method === 'GET') return json(res, 200, { ok: true, engine: existsSync(binary) && existsSync(ffmpeg), gallery: existsSync(path.join(root, 'vendor', 'gallery_dl')), revision: '2026-11-12-download-v3' })
   const origin = String(req.headers.origin || '')
   const isFileDownload = req.method === 'GET' && /^\/api\/dl\/file\/[a-f0-9-]{36}$/.test(pathname)
   if (origin && !cors(res, origin)) return json(res, 403, { error: 'Origen no permitido.' })
@@ -220,7 +215,7 @@ export const server = createServer(async (req, res) => {
       if (isPhoto) format = 'photos'
       if (platform === 'instagram' && format !== 'audio' && format !== 'jpg') format = 'video'
       if (platform === 'pinterest' && format !== 'image') format = 'video'
-      if (!platform || !Object.hasOwn(formats, format)) return json(res, 400, { error: 'Usa un enlace público HTTPS de YouTube, TikTok, Instagram o Pinterest.' })
+      if (!platform || !Object.hasOwn(formats, format)) return json(res, 400, { error: 'Usa un enlace público HTTPS de TikTok, Instagram o Pinterest.' })
       const canonical = new URL(url)
       canonical.hash = ''
       for (const parameter of ['utm_source', 'utm_medium', 'utm_campaign', 'si', 'igsh', 'list', 'start_radio']) canonical.searchParams.delete(parameter)
@@ -259,7 +254,7 @@ export const server = createServer(async (req, res) => {
       else {
         // These clients are recommended by the token provider when default
         // clients fail before the PO token can be generated.
-        await runDownload(url, format, dir, platform === 'youtube' && potReady ? 'mweb,tv,web_safari' : '', platform === 'youtube')
+        await runDownload(url, format, dir)
       }
       const imageFiles = galleryMode ? downloadedImages(dir) : []
       const filename = galleryMode ? imageFiles.length === 1 ? imageFiles[0] : imageFiles.length > 1 ? await packImages(dir, imageFiles) : '' : readdirSync(dir).find(name => /^download\.(mp4|mkv|webm|mp3|m4a|jpg|jpeg)$/i.test(name))
@@ -269,7 +264,7 @@ export const server = createServer(async (req, res) => {
       if (size < 1024) throw new Error('La plataforma entregó un archivo vacío.')
       const id = randomUUID()
       const timer = setTimeout(() => expire(id), 3 * 60000)
-      const shortPlatform = { youtube: 'yt', tiktok: 'tt', instagram: 'ig', pinterest: 'pin' }[platform]
+      const shortPlatform = { tiktok: 'tt', instagram: 'ig', pinterest: 'pin' }[platform]
       const downloadName = `dei v ${shortPlatform}${path.extname(file)}`
       jobs.set(id, { dir, file, size, timer, downloadName, format, key })
       prepared.set(key, id)
@@ -321,23 +316,6 @@ export const server = createServer(async (req, res) => {
 })
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  if (existsSync(potMain) && existsSync(potPlugin)) {
-    const provider = spawn(process.execPath, [potMain, '--host', '127.0.0.1'], { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true })
-    let providerError = ''
-    provider.stderr.on('data', chunk => { providerError = (providerError + String(chunk)).slice(-1000) })
-    provider.on('error', error => { potReady = false; console.error('Proveedor YouTube:', error.message) })
-    provider.on('exit', code => { potReady = false; console.error('Proveedor YouTube terminó:', code, providerError) })
-    for (let attempt = 0; attempt < 60; attempt++) {
-      try {
-        const response = await fetch('http://127.0.0.1:4416/ping', { signal: AbortSignal.timeout(1000) })
-        if (response.ok) { potReady = true; break }
-      } catch { /* el proveedor aún está iniciando */ }
-      await new Promise(resolve => setTimeout(resolve, 500))
-    }
-    if (!potReady) console.error('Proveedor YouTube no respondió:', providerError || 'sin diagnóstico')
-  } else {
-    console.error('Proveedor YouTube no se instaló durante la compilación.')
-  }
-  server.listen(port, '0.0.0.0', () => console.log(`Descargas directas listas en puerto ${port}; token YouTube: ${potReady}`))
+  server.listen(port, '0.0.0.0', () => console.log(`Descargas directas listas en puerto ${port}`))
 }
 
