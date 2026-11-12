@@ -107,7 +107,7 @@ function expire(id) {
 
 function errorMessage(error) {
   const text = error instanceof Error ? error.message : String(error)
-  if (/sign in to confirm|not a bot|login required|sign in/i.test(text)) return 'YouTube exige verificación o inicio de sesión desde este servidor; no puedo descargar este enlace aquí.'
+  if (/sign in to confirm|not a bot|login required|sign in/i.test(text)) return 'La plataforma exige verificación o inicio de sesión desde este servidor; no puedo descargar este enlace aquí.'
   if (/403|challenge|blocked|Unexpected response/i.test(text)) return 'La plataforma bloqueó temporalmente la descarga de este video.'
   if (/private/i.test(text)) return 'Este video es privado o requiere permiso de acceso.'
   if (/timed out|timeout|tardó/i.test(text)) return 'La plataforma tardó demasiado en responder.'
@@ -115,15 +115,13 @@ function errorMessage(error) {
   return text.replace(/^ERROR:\s*/i, '').slice(0, 220)
 }
 
-function runDownload(url, format, dir, youtubeClients = '', isYoutube = false) {
+function runDownload(url, format, dir) {
   return new Promise((resolve, reject) => {
     const args = [
       '--ignore-config', '--no-playlist', '--no-warnings', '--js-runtimes', 'node', '--socket-timeout', '6',
       '--retries', '0', '--fragment-retries', '1', '--extractor-retries', '0',
       '--concurrent-fragments', '4', '--ffmpeg-location', ffmpeg,
-      ...(potReady ? ['--plugin-dirs', potPlugin] : []),
       '-P', dir, '-o', 'download.%(ext)s', ...formats[format],
-      ...(youtubeClients ? ['--extractor-args', `youtube:player_client=${youtubeClients}`] : []),
       '--', url,
     ]
     const child = spawn(binary, args, { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true })
@@ -136,7 +134,7 @@ function runDownload(url, format, dir, youtubeClients = '', isYoutube = false) {
       if (error) reject(error)
       else resolve()
     }
-    const timer = setTimeout(() => { child.kill(); finish(new Error('El video tardó demasiado en procesarse.')) }, isYoutube ? 45000 : 120000)
+    const timer = setTimeout(() => { child.kill(); finish(new Error('El video tardó demasiado en procesarse.')) }, 120000)
     child.stderr.on('data', chunk => { stderr = (stderr + String(chunk)).slice(-4000) })
     child.on('error', finish)
     child.on('close', code => finish(code === 0 ? null : new Error(stderr.trim() || 'No se pudo procesar el enlace.')))
@@ -251,11 +249,7 @@ export const server = createServer(async (req, res) => {
       if (reused) return json(res, 200, reused)
       dir = mkdtempSync(path.join(tmpdir(), 'deyvit-dl-'))
       if (galleryMode) await runGallery(url, dir)
-      else {
-        // These clients are recommended by the token provider when default
-        // clients fail before the PO token can be generated.
-        await runDownload(url, format, dir)
-      }
+      else await runDownload(url, format, dir)
       const imageFiles = galleryMode ? downloadedImages(dir) : []
       const filename = galleryMode ? imageFiles.length === 1 ? imageFiles[0] : imageFiles.length > 1 ? await packImages(dir, imageFiles) : '' : readdirSync(dir).find(name => /^download\.(mp4|mkv|webm|mp3|m4a|jpg|jpeg)$/i.test(name))
       if (!filename) throw new Error('La plataforma no entregó un archivo descargable.')
