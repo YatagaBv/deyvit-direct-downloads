@@ -5,7 +5,9 @@ const origin = 'https://deyvit-blog.surge.sh'
 const samples = [
   ['YouTube', 'https://www.youtube.com/watch?v=ViFHruS6oO8', 'p360'],
   ['TikTok', 'https://www.tiktok.com/@fundacionmaya.bo/video/7494380164235693317', 'video'],
+  ['TikTok audio', 'https://www.tiktok.com/@fundacionmaya.bo/video/7494380164235693317', 'audio'],
   ['Instagram', 'https://www.instagram.com/reels/Dewd-4qNQ0T/', 'video'],
+  ['Instagram JPG', 'https://www.instagram.com/reels/Dewd-4qNQ0T/', 'jpg'],
   ['Pinterest', 'https://es.pinterest.com/pin/1068971661536460645/', 'video'],
 ]
 

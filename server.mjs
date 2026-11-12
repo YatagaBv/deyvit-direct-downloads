@@ -51,7 +51,7 @@ function reserveSlot() {
       const index = waiting.indexOf(entry)
       if (index !== -1) waiting.splice(index, 1)
       reject(new Error('La espera fue demasiado larga. Vuelve a intentarlo.'))
-    }, 90000)
+    }, 20000)
     waiting.push(entry)
   })
 }
@@ -141,7 +141,7 @@ function runDownload(url, format, dir, youtubeClients = '', isYoutube = false) {
       if (error) reject(error)
       else resolve()
     }
-    const timer = setTimeout(() => { child.kill(); finish(new Error('El video tardó demasiado en procesarse.')) }, isYoutube ? 45000 : 180000)
+    const timer = setTimeout(() => { child.kill(); finish(new Error('El video tardó demasiado en procesarse.')) }, isYoutube ? 45000 : 120000)
     child.stderr.on('data', chunk => { stderr = (stderr + String(chunk)).slice(-4000) })
     child.on('error', finish)
     child.on('close', code => finish(code === 0 ? null : new Error(stderr.trim() || 'No se pudo procesar el enlace.')))
@@ -155,7 +155,7 @@ function runGallery(url, dir) {
     let stderr = ''
     let settled = false
     const finish = error => { if (settled) return; settled = true; clearTimeout(timer); error ? reject(error) : resolve() }
-    const timer = setTimeout(() => { child.kill(); finish(new Error('Las imágenes tardaron demasiado en procesarse.')) }, 180000)
+    const timer = setTimeout(() => { child.kill(); finish(new Error('Las imágenes tardaron demasiado en procesarse.')) }, 120000)
     child.stderr.on('data', chunk => { stderr = (stderr + String(chunk)).slice(-4000) })
     child.on('error', finish)
     child.on('close', code => finish(code === 0 ? null : new Error(stderr.trim().split('\n').at(-1) || 'No se pudieron extraer las imágenes.')))
@@ -209,6 +209,7 @@ export const server = createServer(async (req, res) => {
     let dir
     let reserved = false
     let requestKey
+    let ownsPreparation = false
     try {
       const body = await bodyJson(req)
       let url = String(body.url || '')
@@ -237,7 +238,7 @@ export const server = createServer(async (req, res) => {
       const cached = lookup()
       if (cached) return json(res, 200, cached)
       if (preparing.has(key)) {
-        const deadline = Date.now() + 90000
+        const deadline = Date.now() + 145000
         while (preparing.has(key) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 200))
         const ready = lookup()
         if (ready) return json(res, 200, ready)
@@ -247,11 +248,12 @@ export const server = createServer(async (req, res) => {
       }
       const galleryMode = format === 'image' || format === 'photos'
       if (galleryMode && !existsSync(path.join(root, 'vendor', 'gallery_dl'))) return json(res, 503, { error: 'El motor de imágenes todavía no está instalado.' })
+      preparing.add(key)
+      ownsPreparation = true
       await reserveSlot()
       reserved = true
       const reused = lookup()
       if (reused) return json(res, 200, reused)
-      preparing.add(key)
       dir = mkdtempSync(path.join(tmpdir(), 'deyvit-dl-'))
       if (galleryMode) await runGallery(url, dir)
       else {
@@ -279,16 +281,17 @@ export const server = createServer(async (req, res) => {
       dir = undefined
       return json(res, 200, { token: id, size, filename: downloadName })
     } catch (error) {
-      if (requestKey && /sign in|not a bot|login required|verification|403|timed out|tardó/i.test(String(error))) {
+      if (requestKey) {
         if (failures.size >= 100) failures.delete(failures.keys().next().value)
-        failures.set(requestKey, { until: Date.now() + 60000, message: errorMessage(error) })
+        const blocked = /sign in|not a bot|login required|verification|403/i.test(String(error))
+        failures.set(requestKey, { until: Date.now() + (blocked ? 60000 : 10000), message: errorMessage(error) })
       }
       if (/pinterest_.*\.mp4/i.test(String(error))) {
         return json(res, 422, { error: 'Este pin contiene un video. Elige MP4.' })
       }
       return json(res, 422, { error: errorMessage(error) })
     } finally {
-      if (requestKey) preparing.delete(requestKey)
+      if (ownsPreparation) preparing.delete(requestKey)
       if (reserved) releaseSlot()
       if (dir) removeTemp(dir)
     }
