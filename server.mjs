@@ -38,6 +38,7 @@ const formats = {
 const jobs = new Map()
 const prepared = new Map()
 const failures = new Map()
+const preparing = new Set()
 let active = 0
 const waiting = []
 
@@ -119,13 +120,13 @@ function errorMessage(error) {
   return text.replace(/^ERROR:\s*/i, '').slice(0, 220)
 }
 
-function runDownload(url, format, dir, youtubeClients = '', ipv4 = false) {
+function runDownload(url, format, dir, youtubeClients = '', isYoutube = false) {
   return new Promise((resolve, reject) => {
     const args = [
-      '--ignore-config', '--no-playlist', '--verbose', '--js-runtimes', 'node', '--socket-timeout', '8',
-      '--retries', '0', '--ffmpeg-location', ffmpeg,
+      '--ignore-config', '--no-playlist', '--no-warnings', '--js-runtimes', 'node', '--socket-timeout', '6',
+      '--retries', '0', '--fragment-retries', '1', '--extractor-retries', '0',
+      '--concurrent-fragments', '4', '--ffmpeg-location', ffmpeg,
       ...(potReady ? ['--plugin-dirs', potPlugin] : []),
-      ...(ipv4 ? ['--force-ipv4'] : []),
       '-P', dir, '-o', 'download.%(ext)s', ...formats[format],
       ...(youtubeClients ? ['--extractor-args', `youtube:player_client=${youtubeClients}`] : []),
       '--', url,
@@ -140,7 +141,7 @@ function runDownload(url, format, dir, youtubeClients = '', ipv4 = false) {
       if (error) reject(error)
       else resolve()
     }
-    const timer = setTimeout(() => { child.kill(); finish(new Error('El video tardó demasiado en procesarse.')) }, 300000)
+    const timer = setTimeout(() => { child.kill(); finish(new Error('El video tardó demasiado en procesarse.')) }, isYoutube ? 45000 : 180000)
     child.stderr.on('data', chunk => { stderr = (stderr + String(chunk)).slice(-4000) })
     child.on('error', finish)
     child.on('close', code => finish(code === 0 ? null : new Error(stderr.trim() || 'No se pudo procesar el enlace.')))
@@ -196,7 +197,7 @@ async function bodyJson(req) {
 export const server = createServer(async (req, res) => {
   const requestUrl = new URL(req.url || '/', 'http://localhost')
   const { pathname } = requestUrl
-  if (pathname === '/health' && req.method === 'GET') return json(res, 200, { ok: true, engine: existsSync(binary) && existsSync(ffmpeg), gallery: existsSync(path.join(root, 'vendor', 'gallery_dl')), youtubeTokenProvider: potReady, revision: '2026-11-10-cache-v1' })
+  if (pathname === '/health' && req.method === 'GET') return json(res, 200, { ok: true, engine: existsSync(binary) && existsSync(ffmpeg), gallery: existsSync(path.join(root, 'vendor', 'gallery_dl')), youtubeTokenProvider: potReady, revision: '2026-11-12-download-v2' })
   const origin = String(req.headers.origin || '')
   const isFileDownload = req.method === 'GET' && /^\/api\/dl\/file\/[a-f0-9-]{36}$/.test(pathname)
   if (origin && !cors(res, origin)) return json(res, 403, { error: 'Origen no permitido.' })
@@ -235,17 +236,28 @@ export const server = createServer(async (req, res) => {
       }
       const cached = lookup()
       if (cached) return json(res, 200, cached)
+      if (preparing.has(key)) {
+        const deadline = Date.now() + 90000
+        while (preparing.has(key) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 200))
+        const ready = lookup()
+        if (ready) return json(res, 200, ready)
+        const previousError = failures.get(key)
+        if (previousError && previousError.until > Date.now()) return json(res, 422, { error: previousError.message })
+        return json(res, 503, { error: 'No se pudo preparar este archivo. Inténtalo otra vez.' })
+      }
       const galleryMode = format === 'image' || format === 'photos'
       if (galleryMode && !existsSync(path.join(root, 'vendor', 'gallery_dl'))) return json(res, 503, { error: 'El motor de imágenes todavía no está instalado.' })
       await reserveSlot()
       reserved = true
       const reused = lookup()
       if (reused) return json(res, 200, reused)
+      preparing.add(key)
       dir = mkdtempSync(path.join(tmpdir(), 'deyvit-dl-'))
       if (galleryMode) await runGallery(url, dir)
       else {
-        // Repeating an authentication rejection cannot authorize this server.
-        await runDownload(url, format, dir)
+        // These clients are recommended by the token provider when default
+        // clients fail before the PO token can be generated.
+        await runDownload(url, format, dir, platform === 'youtube' && potReady ? 'mweb,tv,web_safari' : '', platform === 'youtube')
       }
       const imageFiles = galleryMode ? downloadedImages(dir) : []
       const filename = galleryMode ? imageFiles.length === 1 ? imageFiles[0] : imageFiles.length > 1 ? await packImages(dir, imageFiles) : '' : readdirSync(dir).find(name => /^download\.(mp4|mkv|webm|mp3|m4a|jpg|jpeg)$/i.test(name))
@@ -267,15 +279,16 @@ export const server = createServer(async (req, res) => {
       dir = undefined
       return json(res, 200, { token: id, size, filename: downloadName })
     } catch (error) {
-      if (requestKey && /sign in|not a bot|login required|verification|403/i.test(String(error))) {
+      if (requestKey && /sign in|not a bot|login required|verification|403|timed out|tardó/i.test(String(error))) {
         if (failures.size >= 100) failures.delete(failures.keys().next().value)
-        failures.set(requestKey, { until: Date.now() + 30000, message: errorMessage(error) })
+        failures.set(requestKey, { until: Date.now() + 60000, message: errorMessage(error) })
       }
       if (/pinterest_.*\.mp4/i.test(String(error))) {
         return json(res, 422, { error: 'Este pin contiene un video. Elige MP4.' })
       }
       return json(res, 422, { error: errorMessage(error) })
     } finally {
+      if (requestKey) preparing.delete(requestKey)
       if (reserved) releaseSlot()
       if (dir) removeTemp(dir)
     }
