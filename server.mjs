@@ -1,9 +1,9 @@
 import { createServer } from 'node:http'
 import { spawn } from 'node:child_process'
-import { createReadStream, existsSync, mkdtempSync, readdirSync, rmSync, statSync } from 'node:fs'
+import { createReadStream, createWriteStream, existsSync, mkdtempSync, readdirSync, rmSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { randomUUID } from 'node:crypto'
+import { createPublicKey, randomUUID, verify } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 
 const root = path.dirname(fileURLToPath(import.meta.url))
@@ -38,6 +38,69 @@ const failures = new Map()
 const preparing = new Set()
 let active = 0
 const waiting = []
+let firebaseKeys = { until: 0, keys: {} }
+
+async function verifiedMusicUser(header) {
+  const token = /^Bearer ([A-Za-z0-9._-]+)$/.exec(String(header || ''))?.[1]
+  if (!token) return false
+  const parts = token.split('.')
+  if (parts.length !== 3) return false
+  try {
+    const head = JSON.parse(Buffer.from(parts[0], 'base64url').toString())
+    const claims = JSON.parse(Buffer.from(parts[1], 'base64url').toString())
+    const now = Math.floor(Date.now() / 1000)
+    if (head.alg !== 'RS256' || typeof head.kid !== 'string' || claims.aud !== 'deyvit-blog' || claims.iss !== 'https://securetoken.google.com/deyvit-blog' || !claims.sub || claims.exp <= now || claims.iat > now || !claims.email_verified || claims.firebase?.sign_in_provider !== 'google.com') return false
+    if (firebaseKeys.until < Date.now()) {
+      const response = await fetch('https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com', { signal: AbortSignal.timeout(8000) })
+      if (!response.ok) return false
+      const body = await response.json()
+      firebaseKeys = { until: Date.now() + 30 * 60000, keys: Object.fromEntries((body.keys || []).map(key => [key.kid, key])) }
+    }
+    const jwk = firebaseKeys.keys[head.kid]
+    return Boolean(jwk && verify('RSA-SHA256', Buffer.from(parts[0] + '.' + parts[1]), createPublicKey({ key: jwk, format: 'jwk' }), Buffer.from(parts[2], 'base64url')))
+  } catch { return false }
+}
+
+export function convertVideoToMp3(input, output, executable = ffmpeg) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(executable, ['-nostdin', '-v', 'error', '-i', input, '-map', '0:a:0', '-vn', '-t', '360', '-c:a', 'libmp3lame', '-b:a', '160k', '-ar', '44100', '-y', output], { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true })
+    let err = '', settled = false
+    const done = error => { if (settled) return; settled = true; clearTimeout(timer); error ? reject(error) : resolve() }
+    const timer = setTimeout(() => { child.kill(); done(new Error('La conversión tardó demasiado.')) }, 60000)
+    child.stderr.on('data', chunk => { err = (err + String(chunk)).slice(-1000) })
+    child.on('error', done)
+    child.on('close', code => done(code === 0 ? null : new Error(/matches no streams/i.test(err) ? 'El video no tiene pista de audio.' : 'No se pudo extraer el audio de este video.')))
+  })
+}
+
+async function extractAudio(req, res) {
+  if (!await verifiedMusicUser(req.headers.authorization)) return json(res, 401, { error: 'Entra con Google para convertir tu video.' })
+  if (!existsSync(ffmpeg)) return json(res, 503, { error: 'El conversor de audio no está disponible.' })
+  const size = Number(req.headers['content-length'])
+  if (!Number.isInteger(size) || size < 1024 || size > 25 * 1024 * 1024) return json(res, 413, { error: 'El video debe pesar menos de 25 MB.' })
+  if (!/^video\/(mp4|webm|quicktime)$/.test(String(req.headers['content-type'] || ''))) return json(res, 415, { error: 'Sube un video MP4, WebM o MOV.' })
+  let dir, reserved = false
+  try {
+    await reserveSlot(); reserved = true
+    dir = mkdtempSync(path.join(tmpdir(), 'deyvit-dl-'))
+    const input = path.join(dir, 'video')
+    const output = path.join(dir, 'audio.mp3')
+    let received = 0
+    await new Promise((resolve, reject) => {
+      const sink = createWriteStream(input)
+      req.on('data', chunk => { received += chunk.length; if (received > 25 * 1024 * 1024) req.destroy(new Error('Video demasiado grande.')) })
+      req.on('error', reject); sink.on('error', reject); sink.on('finish', resolve)
+      req.pipe(sink)
+    })
+    if (received !== size) throw new Error('El video llegó incompleto.')
+    await convertVideoToMp3(input, output)
+    const outputSize = statSync(output).size
+    if (outputSize < 1024 || outputSize > 8 * 1024 * 1024) throw new Error('El audio resultante supera los 8 MB de la biblioteca gratuita.')
+    res.writeHead(200, { 'Content-Type': 'audio/mpeg', 'Content-Length': outputSize, 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' })
+    await new Promise((resolve, reject) => { const stream = createReadStream(output); stream.on('error', reject); res.on('close', resolve); stream.pipe(res) })
+  } catch (error) { if (!res.headersSent) json(res, 422, { error: error instanceof Error ? error.message : 'No se pudo extraer el audio.' }) }
+  finally { if (reserved) releaseSlot(); if (dir) removeTemp(dir) }
+}
 
 function reserveSlot() {
   if (active < 2) { active++; return Promise.resolve() }
@@ -79,7 +142,7 @@ function cors(res, origin) {
   if (!allowedOrigins.has(origin)) return false
   res.setHeader('Access-Control-Allow-Origin', origin)
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization')
   res.setHeader('Vary', 'Origin')
   return true
 }
@@ -196,6 +259,8 @@ export const server = createServer(async (req, res) => {
   if (origin && !cors(res, origin)) return json(res, 403, { error: 'Origen no permitido.' })
   if (!origin && !isFileDownload) return json(res, 403, { error: 'Origen no permitido.' })
   if (req.method === 'OPTIONS') { res.writeHead(204); return res.end() }
+
+  if (pathname === '/api/music/extract' && req.method === 'POST') return extractAudio(req, res)
 
   if (pathname === '/api/dl/prepare' && req.method === 'POST') {
     if (!existsSync(binary) || !existsSync(ffmpeg)) return json(res, 503, { error: 'El motor de descarga todavía no está listo.' })
